@@ -1,98 +1,123 @@
 /*
- * exynos_example.c - BEISPIEL eines durchreichenden Vulkan-ICD im Stil von ExynosTools.
+ * exynos_example.c - v0.5 (HAL-Passthrough fuer Samsung Xclipse, GTA-V-Profil)
  *
- * Idee: Diese Bibliothek wird von der App als "Vulkan-Treiber" geladen, laedt selbst den
- * echten Samsung-Treiber (Backend) und reicht alle Aufrufe durch. Einzelne Aufrufe werden
- * abgefangen. Hier nur eine Demo: vkGetPhysicalDeviceProperties haengt " [ExynosExample]"
- * an den GPU-Namen und schreibt einen Logcat-Eintrag (Tag: ExynosExample).
+ * Erkenntnis aus dem Vergleich mit MdiEx/ExynosTools: Samsungs Vulkan-Treiber ist ein
+ * Android-HAL-Modul. Er exportiert "HMI" (hw_module_t) und vk_icdGetInstanceProcAddrSG,
+ * NICHT vk_icdGetInstanceProcAddr. Custom-Treiber-Loader (AdrenoTools) erwarten ebenfalls
+ * ein HAL-Modul (Symbol "HMI"). v0.1-0.3 exportierten kein HMI -> keine Vulkan-Geraete.
  *
- * v0.2 (GTA-Profil): misst zusaetzlich pro Sekunde FPS, Frametime und wie viel davon in
- * vkQueuePresentKHR verbracht wird (Tag ExynosExample). Viel Zeit im Present = GPU/VSync
- * begrenzt; wenig = CPU (Emulation) begrenzt.
- *
- * KEIN echter Treiber, KEINE BCn-Emulation, ungetestet auf Hardware.
+ * Diese Version exportiert HMI, laedt das echte Samsung-HAL als Backend, oeffnet dessen
+ * Vulkan-Geraet ("vk0") und reicht alles durch. Abgefangen: vkGetPhysicalDeviceProperties
+ * (Namenssuffix) und vkQueuePresentKHR (FPS/Frametime-Log).
+ * Log: Logcat-Tag ExynosExample und Dateien (u.a. /sdcard/Download/exynosgta.log).
+ * Ungetestet auf Hardware.
  */
 #include <dlfcn.h>
 #include <glob.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <android/log.h>
 #include <vulkan/vulkan.h>
 
 #define TAG "ExynosExample"
-static void dolog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-#define LOG(...) dolog(__VA_ARGS__)
 #define EXPORT __attribute__((visibility("default")))
 
-#include <stdarg.h>
+static void dolog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+#define LOG(...) dolog(__VA_ARGS__)
+
 static void dolog(const char *fmt, ...) {
     char buf[512];
     va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
     __android_log_print(ANDROID_LOG_INFO, TAG, "%s", buf);
-    static const char *paths[] = {"/sdcard/Download/exynosgta.log", "/storage/emulated/0/Download/exynosgta.log", NULL};
+    static const char *paths[] = {
+        "/sdcard/Download/exynosgta.log",
+        "/storage/emulated/0/Download/exynosgta.log",
+        "/sdcard/Android/data/app.gamenative/files/exynosgta.log",
+        "/data/data/app.gamenative/files/exynosgta.log",
+        "/data/user/0/app.gamenative/files/exynosgta.log",
+        NULL};
     for (int i = 0; paths[i]; i++) {
         FILE *f = fopen(paths[i], "a");
-        if (f) { fprintf(f, "%s\n", buf); fclose(f); break; }
+        if (f) { fprintf(f, "%s\n", buf); fclose(f); }
     }
 }
 
-typedef PFN_vkVoidFunction (*PFN_icdGIPA)(VkInstance, const char *);
-typedef VkResult (*PFN_icdNegotiate)(uint32_t *);
+__attribute__((constructor)) static void on_load(void) {
+    LOG("== vulkan.exynosgta.so GELADEN (pid %d) ==", (int)getpid());
+}
+
+/* ---- Minimale Android-HAL-Strukturen (Layout wie hardware/hardware.h + hwvulkan.h, 64 Bit) ---- */
+struct hw_module_t;
+struct hw_device_t {
+    uint32_t tag, version;
+    struct hw_module_t *module;
+    uint64_t reserved[12];
+    int (*close)(struct hw_device_t *);
+};
+struct hw_module_methods_t {
+    int (*open)(const struct hw_module_t *, const char *id, struct hw_device_t **dev);
+};
+struct hw_module_t {
+    uint32_t tag;
+    uint16_t module_api_version, hal_api_version;
+    const char *id, *name, *author;
+    struct hw_module_methods_t *methods;
+    void *dso;
+    uintptr_t reserved[32 - 7];
+};
+typedef struct {
+    struct hw_device_t common;
+    PFN_vkEnumerateInstanceExtensionProperties EnumerateInstanceExtensionProperties;
+    PFN_vkCreateInstance CreateInstance;
+    PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
+} hwvulkan_device_t;
 
 static void *g_backend;
-static PFN_icdGIPA g_gipa;
-static PFN_vkGetPhysicalDeviceProperties g_real_props;
+static hwvulkan_device_t *g_real_dev;
+static hwvulkan_device_t g_my_dev;
 
 static void *open_backend(void) {
     if (g_backend) return g_backend;
-    const char *env = getenv("EXYNOSEX_BACKEND"); /* optionaler Pfad zum Samsung-Treiber */
+    const char *env = getenv("EXYNOSEX_BACKEND");
     LOG("open_backend: EXYNOSEX_BACKEND=%s", env ? env : "(nicht gesetzt)");
     if (env) {
         g_backend = dlopen(env, RTLD_NOW | RTLD_LOCAL);
         if (g_backend) return g_backend;
         LOG("dlopen(%s) fehlgeschlagen: %s", env, dlerror());
     }
-
-    glob_t g; /* sucht den Samsung-Treiber in /vendor, ohne einen Dateinamen zu raten */
+    glob_t g;
     int gr = glob("/vendor/lib64/hw/vulkan.*.so", 0, NULL, &g);
-    LOG("glob /vendor/lib64/hw/vulkan.*.so -> Ergebnis %d", gr);
+    LOG("glob /vendor/lib64/hw/vulkan.*.so -> %d", gr);
     if (gr == 0) {
         for (size_t i = 0; i < g.gl_pathc && !g_backend; i++) {
-            if (strstr(g.gl_pathv[i], "ranchu") || strstr(g.gl_pathv[i], "pastel")) continue;
-            g_backend = dlopen(g.gl_pathv[i], RTLD_NOW | RTLD_LOCAL);
-            if (g_backend) LOG("Backend geladen: %s", g.gl_pathv[i]);
-            else LOG("dlopen(%s) fehlgeschlagen: %s", g.gl_pathv[i], dlerror());
+            const char *p = g.gl_pathv[i];
+            if (strstr(p, "ranchu") || strstr(p, "pastel") || strstr(p, "exynosgta")) continue;
+            g_backend = dlopen(p, RTLD_NOW | RTLD_LOCAL);
+            if (g_backend) LOG("Backend geladen: %s", p);
+            else LOG("dlopen(%s) fehlgeschlagen: %s", p, dlerror());
         }
         globfree(&g);
     }
-    if (!g_backend) LOG("Kein Backend gefunden - EXYNOSEX_BACKEND setzen");
     return g_backend;
 }
 
-static PFN_icdGIPA backend_gipa(void) {
-    if (g_gipa) return g_gipa;
-    void *b = open_backend();
-    if (!b) return NULL;
-    g_gipa = (PFN_icdGIPA)dlsym(b, "vk_icdGetInstanceProcAddr");
-    if (!g_gipa) g_gipa = (PFN_icdGIPA)dlsym(b, "vkGetInstanceProcAddr");
-    LOG("Backend-GIPA: %s", g_gipa ? "gefunden" : "NICHT gefunden");
-    return g_gipa;
-}
-
-static void VKAPI_CALL my_GetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalDeviceProperties *p) {
-    g_real_props(pd, p);
-    size_t n = strlen(p->deviceName);
-    const char *sfx = " [ExynosExample]";
-    if (n + strlen(sfx) < VK_MAX_PHYSICAL_DEVICE_NAME_SIZE) strcat(p->deviceName, sfx);
-    LOG("GPU: %s, API %u.%u", p->deviceName, VK_VERSION_MAJOR(p->apiVersion), VK_VERSION_MINOR(p->apiVersion));
-}
-
-
+/* ---- abgefangene Aufrufe ---- */
+static PFN_vkGetPhysicalDeviceProperties g_real_props;
 static PFN_vkQueuePresentKHR g_real_present;
 typedef PFN_vkVoidFunction (*PFN_gdpa)(VkDevice, const char *);
 static PFN_gdpa g_real_gdpa;
+
+static void VKAPI_CALL my_GetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalDeviceProperties *p) {
+    g_real_props(pd, p);
+    const char *sfx = " [ExynosGTA]";
+    if (strlen(p->deviceName) + strlen(sfx) < VK_MAX_PHYSICAL_DEVICE_NAME_SIZE) strcat(p->deviceName, sfx);
+    LOG("GPU: %s, API %u.%u", p->deviceName, VK_VERSION_MAJOR(p->apiVersion), VK_VERSION_MINOR(p->apiVersion));
+}
 
 static double now_ms(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -126,33 +151,55 @@ static PFN_vkVoidFunction VKAPI_CALL my_GetDeviceProcAddr(VkDevice d, const char
     return fn;
 }
 
-EXPORT VkResult vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *v) {
-    void *b = open_backend();
-    PFN_icdNegotiate f = b ? (PFN_icdNegotiate)dlsym(b, "vk_icdNegotiateLoaderICDInterfaceVersion") : NULL;
-    if (f) return f(v);
-    if (*v > 5) *v = 5;
-    return VK_SUCCESS;
-}
-
-EXPORT PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance inst, const char *name) {
-    PFN_icdGIPA real = backend_gipa();
-    if (!real) return NULL;
-    PFN_vkVoidFunction fn = real(inst, name);
-    if (fn && !strcmp(name, "vkGetPhysicalDeviceProperties")) {
+static PFN_vkVoidFunction VKAPI_CALL my_GetInstanceProcAddr(VkInstance inst, const char *name) {
+    PFN_vkVoidFunction fn = g_real_dev->GetInstanceProcAddr(inst, name);
+    if (!fn) return fn;
+    if (!strcmp(name, "vkGetPhysicalDeviceProperties")) {
         g_real_props = (PFN_vkGetPhysicalDeviceProperties)fn;
         return (PFN_vkVoidFunction)my_GetPhysicalDeviceProperties;
     }
-    if (fn && !strcmp(name, "vkGetDeviceProcAddr")) {
+    if (!strcmp(name, "vkGetDeviceProcAddr")) {
         g_real_gdpa = (PFN_gdpa)fn;
         return (PFN_vkVoidFunction)my_GetDeviceProcAddr;
     }
-    if (fn && !strcmp(name, "vkQueuePresentKHR")) {
+    if (!strcmp(name, "vkQueuePresentKHR")) {
         g_real_present = (PFN_vkQueuePresentKHR)fn;
         return (PFN_vkVoidFunction)my_QueuePresentKHR;
     }
     return fn;
 }
 
-EXPORT PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance inst, const char *name) {
-    return vk_icdGetInstanceProcAddr(inst, name);
+extern struct hw_module_t HMI;
+static int my_close(struct hw_device_t *d) { (void)d; return 0; }
+
+static int my_open(const struct hw_module_t *m, const char *id, struct hw_device_t **out) {
+    (void)m;
+    LOG("HAL open(id=%s)", id ? id : "(null)");
+    void *b = open_backend();
+    if (!b) { LOG("FEHLER: kein Samsung-Backend gefunden"); return -1; }
+    struct hw_module_t *bm = (struct hw_module_t *)dlsym(b, "HMI");
+    if (!bm || !bm->methods || !bm->methods->open) { LOG("FEHLER: Backend hat kein HMI/open"); return -1; }
+    struct hw_device_t *rd = NULL;
+    int r = bm->methods->open(bm, id, &rd);
+    LOG("Backend open -> %d, device=%p", r, (void *)rd);
+    if (r != 0 || !rd) return r ? r : -1;
+    g_real_dev = (hwvulkan_device_t *)rd;
+    g_my_dev = *g_real_dev;                       /* Felder (Version, Tag, ...) uebernehmen */
+    g_my_dev.common.module = &HMI;
+    g_my_dev.common.close = my_close;
+    g_my_dev.GetInstanceProcAddr = my_GetInstanceProcAddr;
+    *out = &g_my_dev.common;
+    return 0;
 }
+
+static struct hw_module_methods_t g_methods = { .open = my_open };
+
+EXPORT struct hw_module_t HMI = {
+    .tag = ('H' << 24) | ('W' << 16) | ('M' << 8) | 'T',
+    .module_api_version = 1,
+    .hal_api_version = 0,
+    .id = "vulkan",
+    .name = "ExynosGTA Vulkan passthrough",
+    .author = "example",
+    .methods = &g_methods,
+};
