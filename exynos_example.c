@@ -22,8 +22,21 @@
 #include <vulkan/vulkan.h>
 
 #define TAG "ExynosExample"
-#define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+static void dolog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+#define LOG(...) dolog(__VA_ARGS__)
 #define EXPORT __attribute__((visibility("default")))
+
+#include <stdarg.h>
+static void dolog(const char *fmt, ...) {
+    char buf[512];
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "%s", buf);
+    static const char *paths[] = {"/sdcard/Download/exynosgta.log", "/storage/emulated/0/Download/exynosgta.log", NULL};
+    for (int i = 0; paths[i]; i++) {
+        FILE *f = fopen(paths[i], "a");
+        if (f) { fprintf(f, "%s\n", buf); fclose(f); break; }
+    }
+}
 
 typedef PFN_vkVoidFunction (*PFN_icdGIPA)(VkInstance, const char *);
 typedef VkResult (*PFN_icdNegotiate)(uint32_t *);
@@ -35,14 +48,22 @@ static PFN_vkGetPhysicalDeviceProperties g_real_props;
 static void *open_backend(void) {
     if (g_backend) return g_backend;
     const char *env = getenv("EXYNOSEX_BACKEND"); /* optionaler Pfad zum Samsung-Treiber */
-    if (env && (g_backend = dlopen(env, RTLD_NOW | RTLD_LOCAL))) return g_backend;
+    LOG("open_backend: EXYNOSEX_BACKEND=%s", env ? env : "(nicht gesetzt)");
+    if (env) {
+        g_backend = dlopen(env, RTLD_NOW | RTLD_LOCAL);
+        if (g_backend) return g_backend;
+        LOG("dlopen(%s) fehlgeschlagen: %s", env, dlerror());
+    }
 
     glob_t g; /* sucht den Samsung-Treiber in /vendor, ohne einen Dateinamen zu raten */
-    if (glob("/vendor/lib64/hw/vulkan.*.so", 0, NULL, &g) == 0) {
+    int gr = glob("/vendor/lib64/hw/vulkan.*.so", 0, NULL, &g);
+    LOG("glob /vendor/lib64/hw/vulkan.*.so -> Ergebnis %d", gr);
+    if (gr == 0) {
         for (size_t i = 0; i < g.gl_pathc && !g_backend; i++) {
             if (strstr(g.gl_pathv[i], "ranchu") || strstr(g.gl_pathv[i], "pastel")) continue;
             g_backend = dlopen(g.gl_pathv[i], RTLD_NOW | RTLD_LOCAL);
-            if (g_backend) LOG("Backend: %s", g.gl_pathv[i]);
+            if (g_backend) LOG("Backend geladen: %s", g.gl_pathv[i]);
+            else LOG("dlopen(%s) fehlgeschlagen: %s", g.gl_pathv[i], dlerror());
         }
         globfree(&g);
     }
@@ -56,6 +77,7 @@ static PFN_icdGIPA backend_gipa(void) {
     if (!b) return NULL;
     g_gipa = (PFN_icdGIPA)dlsym(b, "vk_icdGetInstanceProcAddr");
     if (!g_gipa) g_gipa = (PFN_icdGIPA)dlsym(b, "vkGetInstanceProcAddr");
+    LOG("Backend-GIPA: %s", g_gipa ? "gefunden" : "NICHT gefunden");
     return g_gipa;
 }
 

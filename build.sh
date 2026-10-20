@@ -17,10 +17,10 @@ cat > "$OUT/meta.json" <<JSON
   "author": "Beispiel",
   "packageVersion": "1",
   "vendor": "Samsung",
-  "driverVersion": "0.2-gta",
+  "driverVersion": "0.3-gta-diag",
   "minApi": 28,
   "libraryName": "$LIB"
 }
 JSON
-(cd "$OUT" && zip -q ../ExynosGTA-0.2.zip "$LIB" meta.json)
-echo "Fertig: $(pwd)/ExynosGTA-0.2.zip"
+(cd "$OUT" && zip -q ../ExynosGTA-0.3.zip "$LIB" meta.json)
+echo "Fertig: $(pwd)/ExynosGTA-0.3.zip"

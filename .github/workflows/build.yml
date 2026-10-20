@@ -15,13 +15,13 @@ jobs:
           chmod +x build.sh
           ./build.sh "$NDK"
           echo "--- Inhalt des Treiber-ZIPs ---"
-          unzip -l ExynosGTA-0.2.zip
+          unzip -l ExynosGTA-0.3.zip
           file out/libvulkan_exynos_gta.so
       # Die Dateien liegen direkt im Artifact-ZIP (kein verschachteltes ZIP):
       # das heruntergeladene ZIP ist selbst der Treiber.
       - uses: actions/upload-artifact@v4
         with:
-          name: ExynosGTA-0.2-driver
+          name: ExynosGTA-0.3-driver
           path: |
             out/libvulkan_exynos_gta.so
             out/meta.json
