@@ -1,4 +1,4 @@
-name: Build ExynosExample
+name: Build ExynosGTA
 
 on:
   push:
@@ -17,5 +17,5 @@ jobs:
           ./build.sh "$NDK"
       - uses: actions/upload-artifact@v4
         with:
-          name: ExynosExample-0.1
-          path: ExynosExample-0.1.zip
+          name: ExynosGTA-0.2
+          path: ExynosGTA-0.2.zip

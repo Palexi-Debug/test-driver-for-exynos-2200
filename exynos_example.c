@@ -6,6 +6,10 @@
  * abgefangen. Hier nur eine Demo: vkGetPhysicalDeviceProperties haengt " [ExynosExample]"
  * an den GPU-Namen und schreibt einen Logcat-Eintrag (Tag: ExynosExample).
  *
+ * v0.2 (GTA-Profil): misst zusaetzlich pro Sekunde FPS, Frametime und wie viel davon in
+ * vkQueuePresentKHR verbracht wird (Tag ExynosExample). Viel Zeit im Present = GPU/VSync
+ * begrenzt; wenig = CPU (Emulation) begrenzt.
+ *
  * KEIN echter Treiber, KEINE BCn-Emulation, ungetestet auf Hardware.
  */
 #include <dlfcn.h>
@@ -13,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <android/log.h>
 #include <vulkan/vulkan.h>
 
@@ -62,6 +67,43 @@ static void VKAPI_CALL my_GetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhy
     LOG("GPU: %s, API %u.%u", p->deviceName, VK_VERSION_MAJOR(p->apiVersion), VK_VERSION_MINOR(p->apiVersion));
 }
 
+
+static PFN_vkQueuePresentKHR g_real_present;
+typedef PFN_vkVoidFunction (*PFN_gdpa)(VkDevice, const char *);
+static PFN_gdpa g_real_gdpa;
+
+static double now_ms(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
+}
+
+static VkResult VKAPI_CALL my_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) {
+    static double last, win_start, in_present, worst;
+    static unsigned frames;
+    double t0 = now_ms();
+    VkResult r = g_real_present(q, pi);
+    double t1 = now_ms();
+    if (last > 0 && t1 - last > worst) worst = t1 - last;
+    last = t1; in_present += t1 - t0; frames++;
+    if (win_start == 0) win_start = t0;
+    if (t1 - win_start >= 1000.0) {
+        double span = t1 - win_start;
+        LOG("FPS %.1f | avg %.1f ms | worst %.1f ms | im Present %.0f%%",
+            frames * 1000.0 / span, span / frames, worst, 100.0 * in_present / span);
+        win_start = t1; frames = 0; in_present = 0; worst = 0;
+    }
+    return r;
+}
+
+static PFN_vkVoidFunction VKAPI_CALL my_GetDeviceProcAddr(VkDevice d, const char *name) {
+    PFN_vkVoidFunction fn = g_real_gdpa(d, name);
+    if (fn && !strcmp(name, "vkQueuePresentKHR")) {
+        g_real_present = (PFN_vkQueuePresentKHR)fn;
+        return (PFN_vkVoidFunction)my_QueuePresentKHR;
+    }
+    return fn;
+}
+
 EXPORT VkResult vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *v) {
     void *b = open_backend();
     PFN_icdNegotiate f = b ? (PFN_icdNegotiate)dlsym(b, "vk_icdNegotiateLoaderICDInterfaceVersion") : NULL;
@@ -77,6 +119,14 @@ EXPORT PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance inst, const char 
     if (fn && !strcmp(name, "vkGetPhysicalDeviceProperties")) {
         g_real_props = (PFN_vkGetPhysicalDeviceProperties)fn;
         return (PFN_vkVoidFunction)my_GetPhysicalDeviceProperties;
+    }
+    if (fn && !strcmp(name, "vkGetDeviceProcAddr")) {
+        g_real_gdpa = (PFN_gdpa)fn;
+        return (PFN_vkVoidFunction)my_GetDeviceProcAddr;
+    }
+    if (fn && !strcmp(name, "vkQueuePresentKHR")) {
+        g_real_present = (PFN_vkQueuePresentKHR)fn;
+        return (PFN_vkVoidFunction)my_QueuePresentKHR;
     }
     return fn;
 }
